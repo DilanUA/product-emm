@@ -1,0 +1,251 @@
+<html>
+    <head>
+        <title>BYOD-WIFI-ACCESS | WSO2-EMM</title>
+    </head>
+    <body>
+        <h2>BYOD-WIFI-ACCESS Via WSO2-EMM :</h2>
+        <h3>Execution Status:</h3>
+        <%
+            /* Start-of-server-side-jaggery-script */
+
+            /* What follows: Setting up global variables required.
+             * switchURL, clientMAC, redirectURL may be set to null. */
+            var switchURL = request.getParameter("switch_url");
+            var clientMAC = request.getParameter("client_mac");
+            var redirectURL = request.getParameter("redirect");
+            var username;
+            var token;
+            var isOkToTryLogin = false;
+
+            /* What follows: Implementation logic of the script. */
+            if (!switchURL || !clientMAC) {
+                /* Info: This occurs when the login fails and 
+                 * CISCO-WLC redirects the user back to this page or
+                 * when the page is accessed without the required query string values. */
+                sendMsgToDeviceBrowser("Expected query string is missing in the request URL.");
+                sendMsgToDeviceBrowser("Erroneous access detected...");
+            } else {
+                /* What follows: Calling provisionWIFI() function. */
+                var retValProvisionWIFI = provisionWIFI(clientMAC);
+
+                if (retValProvisionWIFI.isSuccessful) {
+                    /* Info: This occurs when function execution is successful 
+                     * in updating the user token at LDAP2. */
+                    if (redirectURL == null) {
+                        /* What follows: If redirectURL is not set, setting up some default URL. */
+                        redirectURL = "http://www.google.com";
+                    }
+                    isOkToTryLogin = true;
+                    sendMsgToDeviceBrowser("An Internet session is currently unavailable.");
+                    sendMsgToDeviceBrowser("Updating user token and redirecting to authenticate...");
+                } else {
+                    if (retValProvisionWIFI.description == "MAC_NOT_REGISTERED") {
+                        /* What follows: Redirecting to the download page of emm client app. */
+                        response.sendRedirect("/emm/api/device_enroll");
+                    }
+                    sendMsgToDeviceBrowser("Updating user token failed: " + retValProvisionWIFI.description);
+                    sendMsgToDeviceBrowser("An Internet session is currently unavailable.");
+                    sendMsgToDeviceBrowser("Try log-in manually.");
+                }
+            }
+
+            /* What follows: Declarations of functions */
+
+            /**
+             * Following method prints a message on the client browser
+             * based on the given message input.
+             *
+             * @param msg Message to be sent to the device browser.
+             */
+            function sendMsgToDeviceBrowser(msg) {
+                msg = "<p>" + msg + "</p>";
+                print(msg);
+            }
+
+            /**
+             * Following method takes a mobile device MAC address as input and
+             * updates username & token variables for another WIFI session.
+             *
+             * @param clientMAC Device MAC number to be considered for provisioning WIFI.
+             * @return executionStatus A JSON containing two key value pairs as follows.
+             * [1] "isSuccessful" - a Boolean
+             * [2] "description" - a String
+             */
+            function provisionWIFI(clientMAC) {
+                /* What follows: Declaring information to be
+                 * returned with default values. */
+                var executionStatus = {};
+                executionStatus.isSuccessful = false;
+                executionStatus.description = null;
+
+                /* What follows: Importing common.js and trying to connect EMM-DB. */
+                var common = require("/modules/common.js");
+                var db = common.getDatabase();
+
+                if (!db) {
+                    executionStatus.description = "DB_CONNECT_ERROR";
+                    return executionStatus;
+                }
+
+                /* What follows: Importing driver.js and trying to query EMM-DB. */
+                var driver = require("driver").driver(db);
+                var queryResult = driver.query("SELECT user_id FROM devices WHERE LOWER(mac) = '" +
+                                    clientMAC.toLowerCase() + "';");
+
+                if (!Array.isArray(queryResult)) {
+                    executionStatus.description = "DB_QUERY_ERROR";
+                    return executionStatus;
+                }
+
+                /* What follows: If accessing the db and querying the db are successful,
+                continuing execution based on the query result. */
+                if (queryResult.length == 0) {
+                    /* Info: This occurs when the provided MAC
+                     * is not already registered inside EMM-DB. */
+                    executionStatus.description = "MAC_NOT_REGISTERED";
+                } else if (queryResult.length == 1) {
+                    /* Info: This occurs when the provided MAC has been
+                     * already registered inside EMM-DB.
+                     * In this case, the existing token for this device
+                     * is considered to be expired
+                     * or just after registering the device, 
+                     * control is redirected to this flow. */
+
+                    /* What follows: Adding pseudo-code here...
+                     * If the device is already registered & if the existing token in LDAP2 is expired
+                     * Simply, token = deleteUserFromLDAP2(); createNewToken(); addUserToLDAP2(token);
+                     * If the device is already registered & if there is no current entry in LDAP2
+                     * Simply, token = createNewToken(); addUserToLDAP2(token); */
+
+                    var userModule = require("/modules/user.js").user;
+                    var user = new userModule(db);
+
+                    /* What follows: Obtaining user-id in LDAP1 under which
+                     * the provided MAC is registered. */
+
+                    var userIdInLDAP1 = queryResult[0].user_id;
+
+                    /* What follows: Retrieving already existing User Data in LDAP1
+                     * to create its copy in LDAP2. */
+                    var retValGetUser = user.getUser({"userid" : userIdInLDAP1});                
+                    if (retValGetUser == "Error occurred while retrieving user.") {
+                        executionStatus.description = "USER_NOT_RETRIEVED";
+                    } else {
+                        /* What follows: Obtained user-id structure is like this: domainName/username.
+                         * By that, extracting username as follows. */
+                        var usernameInLDAP1 = userIdInLDAP1.substring(userIdInLDAP1.indexOf("/") + 1);
+
+                        /* What follows: Constructing userId of the user to be inserted into LDAP 2. */
+                        var configFile = require('/config/emm.js').config();
+                        var ldap2DomainName = configFile.byodWifiConf.secondaryLDAPName;
+                        var usernameForLDAP2 = "wifi-user-" + usernameInLDAP1;
+                        var userIdForLDAP2 = ldap2DomainName + "/" + usernameForLDAP2;
+
+                        /* What follows: If the user already exists in LDAP2,
+                         * delete it to update the session token. */
+                        var retValDeleteUser = null;
+                        if (user.doesExist(userIdForLDAP2)) {
+                            retValDeleteUser = user.deleteUser({"userid" : userIdForLDAP2});
+                        }
+
+                        if (retValDeleteUser == 404) {
+                            executionStatus.description = "USER_NOT_DELETED";
+                        } else {
+                            /* Info: This occurs if, retValDeleteUser == 200 */
+
+                            /* What follows: Constructing the userCtxForLDAP2. */
+                            var userCtxInLDAP1 = retValGetUser;
+                            var userCtxForLDAP2 = {
+                                "tenant_id"     : userCtxInLDAP1["tenantId"],
+                                "username"      : userIdForLDAP2,
+                                "email"         : userCtxInLDAP1["email"],
+                                "first_name"    : userCtxInLDAP1["firstName"],
+                                "last_name"     : userCtxInLDAP1["lastName"],
+                                "type"          : userCtxInLDAP1["user_type"],
+                                "groups"        : ["Internal/everyone"],
+                                "files"         : null
+                            };
+
+                            /* What follows: Add user data to LDAP2 with a new session token. */
+                            var retValAddUser = user.addUser(userCtxForLDAP2);
+                            if (retValAddUser.status != "SUCCESSFULL") {
+                                executionStatus.description = "USER_NOT_ADDED";
+                            } else {
+                                /* what follows: Set username and token
+                                 * to be considered for the new internet session. */
+                                username = usernameForLDAP2;
+                                token = retValAddUser.generatedPassword;
+
+                                executionStatus.isSuccessful = true;
+                                executionStatus.description = "USER_TOKEN_UPDATED";
+                            }
+                        }
+                    }
+                } else {
+                    executionStatus.description = "UNEXPECTED_QUERY_RESULT";
+                }
+                return executionStatus;
+            }
+
+            /* End-of-server-side-jaggery-script */
+        %>
+
+        <div id = "login-form-container" >
+            <form id = "login-form" method = "post" action = "" >
+                <input type = "hidden" id = "username" name = "username" value = "" >
+                <input type = "hidden" id = "password" name = "password" value = "" >
+                <input type = "hidden" id = "redirect_url" name = "redirect_url" value = "" >
+                <input type = "hidden" id = "buttonClicked" name = "buttonClicked" value = "" >
+            </form>
+        </div>
+
+        <script>
+
+            /* Info: Adding the following javascript at the end of the body tag
+             * to render html form content first and then to apply the following on that. */
+
+            /* What follows: Retrieving server-side jaggery values to client-side. */
+            var isOkToTryLogin = "<%=isOkToTryLogin%>";
+
+            /* What follows: Only allowing a login request if and only-if isOkToTryLogin == 'true' */
+            if (isOkToTryLogin == "true") {
+               /* What follows: Retrieving server-side jaggery values to client-side. */
+               var username = "<%=username%>";
+               var password = "<%=token%>";
+               var switchURL = "<%=switchURL%>";
+               var redirectURL = "<%=redirectURL%>";
+
+               /* What follows: Initiate login request.
+                * Info: Why buttonClicked is set to 4 ? -->
+                * Then only CISCO web-auth login script gets to know that 
+                * its login form has been submitted to verify a user.
+                * In other words, this is the way to bypass the web-auth-login form and
+                * jump directly into CISCO-WLC's verification process of login credentials. */
+                submitLoginCredentials(switchURL, username, password, 4, redirectURL);
+            }
+
+            /* What follows: declarations of functions */
+
+            /**
+             * Following method automates the login process by attaching the form values
+             * and executing the form submit() function.
+             *
+             * @param actionURL Destination URL to which form values will be submitted.
+             * @param username Username to be checked.
+             * @param password Password to be checked.
+             * @param buttonClicked A custom value to be provided to initiate authentication.
+             * @param redirectURL User-specified URL to load once WIFI access to Internet is granted.
+             */
+            function submitLoginCredentials(actionURL, username, password, buttonClicked, redirectURL) {
+                document.forms[0].action = actionURL;
+                document.forms[0].username.value = username;
+                document.forms[0].password.value = password;
+                document.forms[0].buttonClicked.value = buttonClicked;
+                document.forms[0].redirect_url.value = redirectURL;
+                document.forms[0].submit();
+            }
+
+        </script>
+    </body>
+</html>
+
